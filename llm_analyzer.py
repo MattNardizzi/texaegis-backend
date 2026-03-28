@@ -64,7 +64,7 @@ class LLMAnalyzer:
         model: Optional[str] = None,
         api_key: Optional[str] = None,
     ) -> None:
-        self.provider = (provider or os.getenv("TEX_LLM_PROVIDER", "anthropic")).strip().lower()
+        self.provider = (provider or os.getenv("TEX_LLM_PROVIDER", "openai")).strip().lower()
         self.model = model or os.getenv("TEX_LLM_MODEL") or self._default_model_for_provider(self.provider)
         self.api_key = api_key or self._api_key_from_env(self.provider)
 
