@@ -35,64 +35,33 @@ class LLMAnalyzerError(Exception):
 
 class LLMAnalyzer:
     """
-    Provider-agnostic semantic analyzer for Tex Aegis.
+    OpenAI-only semantic analyzer for Tex Aegis.
 
-    The rest of Tex should not care which model provider is used.
-    This class selects a provider at runtime and normalizes the result
-    into a SemanticEvaluation.
-
-    Supported providers in this file:
-    - openai
-    - anthropic
-
-    Configuration:
-    - TEX_LLM_PROVIDER: "openai" or "anthropic"
-    - TEX_LLM_MODEL: provider-specific model name
-
-    Provider credentials:
-    - OPENAI_API_KEY
-    - ANTHROPIC_API_KEY
-
-    Notes:
-    - If initialization fails, main.py should fall back to deterministic-only mode.
-    - The model never has final decision authority. It only returns analysis.
+    This layer analyzes one outbound email and returns structured
+    semantic risk signals. It does not make the final permit/forbid decision.
     """
 
     def __init__(
         self,
-        provider: Optional[str] = None,
         model: Optional[str] = None,
         api_key: Optional[str] = None,
     ) -> None:
-        self.provider = (provider or os.getenv("TEX_LLM_PROVIDER", "openai")).strip().lower()
-        self.model = model or os.getenv("TEX_LLM_MODEL") or self._default_model_for_provider(self.provider)
-        self.api_key = api_key or self._api_key_from_env(self.provider)
-
-        if self.provider not in {"openai", "anthropic"}:
-            raise LLMAnalyzerError(
-                f"Unsupported TEX_LLM_PROVIDER '{self.provider}'. "
-                "Supported providers: openai, anthropic."
-            )
+        self.model = model or os.getenv("TEX_LLM_MODEL", "gpt-4.1-mini")
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
 
         if not self.api_key:
             raise LLMAnalyzerError(
-                f"Missing API key for provider '{self.provider}'. "
-                f"Expected env var: {self._api_key_env_name(self.provider)}"
+                "Missing OPENAI_API_KEY for semantic analyzer."
             )
 
     def analyze(self, email: OutboundEmail) -> SemanticEvaluation:
-        """
-        Run semantic analysis on one outbound email and return normalized results.
-        """
         system_prompt = self._build_system_prompt()
         user_prompt = self._build_user_prompt(email)
 
-        if self.provider == "openai":
-            raw_data = self._analyze_with_openai(system_prompt=system_prompt, user_prompt=user_prompt)
-        elif self.provider == "anthropic":
-            raw_data = self._analyze_with_anthropic(system_prompt=system_prompt, user_prompt=user_prompt)
-        else:
-            raise LLMAnalyzerError(f"Unsupported provider '{self.provider}'.")
+        raw_data = self._analyze_with_openai(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+        )
 
         try:
             validated = _LLMResponseSchema.model_validate(raw_data)
@@ -108,14 +77,11 @@ class LLMAnalyzer:
         system_prompt: str,
         user_prompt: str,
     ) -> Dict[str, Any]:
-        """
-        Use OpenAI Responses API with structured JSON schema output.
-        """
         try:
             from openai import OpenAI
         except Exception as exc:
             raise LLMAnalyzerError(
-                "OpenAI SDK is not installed, but TEX_LLM_PROVIDER is set to 'openai'."
+                "OpenAI SDK is not installed."
             ) from exc
 
         client = OpenAI(api_key=self.api_key)
@@ -145,86 +111,8 @@ class LLMAnalyzer:
 
         return self._parse_json_text(raw_text, provider_name="OpenAI")
 
-    def _analyze_with_anthropic(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-    ) -> Dict[str, Any]:
-        """
-        Use Anthropic Messages API and require JSON-only output.
-        """
-        try:
-            from anthropic import Anthropic
-        except Exception as exc:
-            raise LLMAnalyzerError(
-                "Anthropic SDK is not installed, but TEX_LLM_PROVIDER is set to 'anthropic'."
-            ) from exc
-
-        client = Anthropic(api_key=self.api_key)
-
-        json_only_user_prompt = (
-            f"{user_prompt}\n\n"
-            "Return ONLY valid JSON matching this exact schema:\n"
-            f"{json.dumps(self._response_json_schema(), ensure_ascii=False)}"
-        )
-
-        try:
-            response = client.messages.create(
-                model=self.model,
-                max_tokens=1500,
-                system=system_prompt,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": json_only_user_prompt,
-                    }
-                ],
-            )
-        except Exception as exc:
-            raise LLMAnalyzerError(f"Anthropic request failed: {exc}") from exc
-
-        text_blocks: list[str] = []
-        for block in getattr(response, "content", []):
-            if getattr(block, "type", None) == "text":
-                block_text = getattr(block, "text", "")
-                if block_text:
-                    text_blocks.append(block_text)
-
-        raw_text = "\n".join(text_blocks).strip()
-        if not raw_text:
-            raise LLMAnalyzerError("Anthropic returned empty output.")
-
-        return self._parse_json_text(raw_text, provider_name="Anthropic")
-
-    @staticmethod
-    def _default_model_for_provider(provider: str) -> str:
-        defaults = {
-            "openai": "gpt-4.1-mini",
-            "anthropic": "claude-sonnet-4-5",
-        }
-        if provider not in defaults:
-            raise LLMAnalyzerError(f"No default model configured for provider '{provider}'.")
-        return defaults[provider]
-
-    @staticmethod
-    def _api_key_env_name(provider: str) -> str:
-        env_names = {
-            "openai": "OPENAI_API_KEY",
-            "anthropic": "ANTHROPIC_API_KEY",
-        }
-        if provider not in env_names:
-            raise LLMAnalyzerError(f"No API key env mapping configured for provider '{provider}'.")
-        return env_names[provider]
-
-    def _api_key_from_env(self, provider: str) -> Optional[str]:
-        return os.getenv(self._api_key_env_name(provider))
-
     @staticmethod
     def _parse_json_text(raw_text: str, provider_name: str) -> Dict[str, Any]:
-        """
-        Parse JSON from a provider response. Tries strict parse first.
-        If the model wrapped JSON in extra text, extract the outermost object.
-        """
         raw_text = raw_text.strip()
 
         try:
@@ -251,12 +139,35 @@ class LLMAnalyzer:
             "Your job is to analyze one AI-generated outbound business email.\n"
             "You do not decide whether the email is sent. "
             "You only produce structured risk analysis.\n\n"
-            "Evaluate the email across exactly these dimensions:\n"
+            "Evaluate the email across exactly these dimensions:\n\n"
             "1. factual_accuracy\n"
+            "   - Claims about product features, capabilities, or integrations that cannot be verified from the email alone\n"
+            "   - Specific statistics, percentages, or performance metrics presented as fact\n"
+            "   - References to certifications, compliance standards, or regulatory status\n"
+            "   - Outcome claims (e.g. 'reduce churn by 40%') without verifiable sourcing\n"
+            "   - Any statement a recipient could rely on that may be hallucinated by an AI\n\n"
             "2. data_leakage\n"
+            "   - PII such as SSNs, credit card numbers, phone numbers, or credentials\n"
+            "   - Naming other customers, clients, or accounts and their business details\n"
+            "   - Disclosing another customer's pricing, contract terms, tier, or discount\n"
+            "   - Referencing another customer's account manager, contact person, or internal staff by name\n"
+            "   - Sharing another customer's results, outcomes, or performance metrics with a prospect\n"
+            "   - Internal URLs, API keys, tokens, or system identifiers\n"
+            "   - ANY information about a third party that the recipient should not have access to\n\n"
             "3. tone_appropriateness\n"
+            "   - Overly casual, pushy, or aggressive language for a business context\n"
+            "   - Urgency tactics or pressure language ('don't miss out', 'limited time')\n"
+            "   - Unprofessional informality (slang, excessive exclamation marks, emojis)\n"
+            "   - Offering personal contact channels (texting, weekends) in a first outreach\n\n"
             "4. policy_compliance\n"
-            "5. recipient_authorization\n\n"
+            "   - Unauthorized discounts, pricing exceptions, or special offers\n"
+            "   - Commitments or promises that may create contractual obligations\n"
+            "   - Claims that may violate advertising or marketing regulations\n"
+            "   - Content that bypasses standard approval workflows\n\n"
+            "5. recipient_authorization\n"
+            "   - Whether prior contact or consent is referenced or implied\n"
+            "   - Cold outreach without clear opt-in or prior relationship signals\n"
+            "   - Whether the sender has apparent authority to contact this recipient\n\n"
             "For each dimension, return:\n"
             "- score: a float from 0.0 to 1.0\n"
             "- finding: one concrete explanation\n"
@@ -271,6 +182,7 @@ class LLMAnalyzer:
             "- Do not invent facts outside the email.\n"
             "- Quote actual email text in evidence whenever possible.\n"
             "- If something looks suspicious but cannot be confirmed from the text alone, say so clearly.\n"
+            "- Naming another customer by name and sharing their details with a prospect is a serious data leakage violation.\n"
             "- Output only the required JSON object."
         )
 
